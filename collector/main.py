@@ -60,13 +60,13 @@ def save_sent_ids(ids: set[str]) -> None:
 def is_relevant(article: dict, user_raw: dict) -> bool:
     """除外ワードが含まれていなければ通す。"""
     target = " ".join([
-        article.get("name", ""),
-        article.get("description", ""),
-        article.get("body", "")[:300],
-        user_raw.get("nickname", ""),
-        user_raw.get("name", ""),
-        user_raw.get("profile", ""),
-        user_raw.get("biography", ""),
+        article.get("name") or "",
+        article.get("description") or "",
+        (article.get("body") or "")[:300],
+        user_raw.get("nickname") or "",
+        user_raw.get("name") or "",
+        user_raw.get("profile") or "",
+        user_raw.get("biography") or "",
     ])
 
     # 除外ワードに1つでも引っかかれば除外
