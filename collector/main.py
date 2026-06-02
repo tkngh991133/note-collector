@@ -17,10 +17,25 @@ import httpx
 # ─── 設定 ────────────────────────────────────────────────────────────────────
 
 TAGS = ["経営", "社長", "中小企業"]
-ARTICLES_PER_TAG = 8          # タグごとの取得件数（重複除去後に10〜15件に絞る）
+ARTICLES_PER_TAG = 20         # タグごとの取得件数（フィルタ後に10〜15件に絞る）
 MAX_ARTICLES = 15              # 最終的に配信する最大件数
 MIN_ARTICLES = 10              # 最低配信件数
 BODY_PREVIEW_LEN = 100        # 本文冒頭の文字数
+
+# ─── フィルタリング設定 ───────────────────────────────────────────────────────
+# いずれか1つでも含まれていれば関連記事と判定
+INCLUDE_KEYWORDS = [
+    "経営", "社長", "CEO", "代表取締役", "起業", "事業",
+    "経営者", "創業", "代表", "マネジメント", "経営戦略",
+    "ビジネスオーナー", "スタートアップ", "ベンチャー",
+    "IT経営", "DX", "SaaS", "受託", "派遣", "エンジニア派遣",
+]
+# 1つでも含まれていたら除外
+EXCLUDE_KEYWORDS = [
+    "競艇", "競輪", "競馬", "パチンコ", "スロット", "ギャンブル",
+    "予想屋", "舟券", "車券", "馬券", "オッズ", "払い戻し",
+    "カジノ", "ポーカー", "麻雀", "宝くじ",
+]
 
 SENT_IDS_PATH = Path(__file__).parent.parent / "sent_ids.json"
 
@@ -45,6 +60,30 @@ def save_sent_ids(ids: set[str]) -> None:
         json.dumps({"ids": sorted(ids)}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+# ─── フィルタリング ───────────────────────────────────────────────────────────
+
+def is_relevant(article: dict, user_raw: dict) -> bool:
+    """関連記事かどうか判定する。除外ワードに引っかかればFalse、包含ワードがなければFalse。"""
+    # 判定対象テキストを全部まとめる（タイトル・本文冒頭・著者名・プロフィール）
+    target = " ".join([
+        article.get("name", ""),
+        article.get("description", ""),
+        article.get("body", "")[:300],
+        user_raw.get("nickname", ""),
+        user_raw.get("name", ""),
+        user_raw.get("profile", ""),         # プロフィール文（フィールドがあれば）
+        user_raw.get("biography", ""),        # 同上（別フィールド名）
+    ])
+
+    # 除外ワードチェック（1つでも含まれたら即除外）
+    for kw in EXCLUDE_KEYWORDS:
+        if kw in target:
+            return False
+
+    # 包含ワードチェック（1つも含まれなければ除外）
+    return any(kw in target for kw in INCLUDE_KEYWORDS)
 
 
 # ─── note.com 記事取得 ────────────────────────────────────────────────────────
@@ -86,9 +125,15 @@ def collect_candidates(sent_ids: set[str]) -> list[dict]:
                 continue
             if key in seen or key in sent_ids:
                 continue
-            seen.add(key)
 
             user = a.get("user", {})
+
+            # フィルタリング（除外ワード・包含ワード判定）
+            if not is_relevant(a, user):
+                print(f"[SKIP] フィルタ除外: {a.get('name', '')[:40]}")
+                continue
+
+            seen.add(key)
             urlname = user.get("urlname", "")
 
             # プレビュー：description → body の順で取得
