@@ -1,15 +1,17 @@
 """
-note.com 中小企業・IT系経営者記事収集 → Anthropic要約 → Teams配信
+note.com 中小企業・IT系経営者記事収集 → Gmail配信
 """
 
 import json
 import os
+import smtplib
 import time
 from datetime import datetime, timezone, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 import httpx
-import anthropic
 
 # ─── 設定 ────────────────────────────────────────────────────────────────────
 
@@ -17,12 +19,13 @@ TAGS = ["経営", "社長", "中小企業"]
 ARTICLES_PER_TAG = 8          # タグごとの取得件数（重複除去後に10〜15件に絞る）
 MAX_ARTICLES = 15              # 最終的に配信する最大件数
 MIN_ARTICLES = 10              # 最低配信件数
+BODY_PREVIEW_LEN = 100        # 本文冒頭の文字数
 
 SENT_IDS_PATH = Path(__file__).parent.parent / "sent_ids.json"
 
 NOTE_SEARCH_URL = "https://note.com/api/v2/searches"
-TEAMS_WEBHOOK_URL = os.environ["TEAMS_WEBHOOK_URL"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]         # 送信元 = 送信先（同じアドレス）
+GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]  # Googleアプリパスワード
 
 JST = timezone(timedelta(hours=9))
 
@@ -89,14 +92,18 @@ def collect_candidates(sent_ids: set[str]) -> list[dict]:
             seen.add(unique_id)
 
             user = a.get("user", {})
+            raw_body = a.get("body", "") or a.get("description", "") or ""
+            preview = raw_body[:BODY_PREVIEW_LEN].strip()
+            if len(raw_body) > BODY_PREVIEW_LEN:
+                preview += "…"
+
             candidates.append({
                 "id": unique_id,
                 "title": a.get("name", "（タイトルなし）"),
                 "author": user.get("nickname", user.get("urlname", "不明")),
                 "url": f"https://note.com/{user.get('urlname', '')}/n/{key}" if key else "",
-                "body": a.get("body", "") or a.get("description", "") or "",
+                "preview": preview,
                 "published_at": a.get("publishAt", ""),
-                "tag": tag,
             })
 
     # 新しい順に並べて最大MAX_ARTICLES件
@@ -104,135 +111,63 @@ def collect_candidates(sent_ids: set[str]) -> list[dict]:
     return candidates[:MAX_ARTICLES]
 
 
-# ─── Anthropic 要約 ───────────────────────────────────────────────────────────
+# ─── Gmail 配信 ───────────────────────────────────────────────────────────────
 
-def summarize_articles(articles: list[dict]) -> list[dict]:
-    """各記事を3行要約＋ネタ切り口コメント付きで返す"""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    for article in articles:
-        title = article["title"]
-        body_snippet = article["body"][:800] if article["body"] else "（本文なし）"
-
-        prompt = f"""あなたは中小企業・IT系経営者向けの情報キュレーターです。
-以下のnote記事について答えてください。
-
-【タイトル】{title}
-【本文抜粋】{body_snippet}
-
-以下の形式でJSON出力してください（他の文字は一切出力しない）：
-{{
-  "summary": "3行の要約（各行を改行区切りで）",
-  "angle": "この記事がネタになりそうな切り口を1文で"
-}}"""
-
-        try:
-            message = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = message.content[0].text.strip()
-            # JSONブロックがあれば抽出
-            if "```" in raw:
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            parsed = json.loads(raw)
-            article["summary"] = parsed.get("summary", "要約取得失敗")
-            article["angle"] = parsed.get("angle", "")
-        except Exception as e:
-            print(f"[WARN] 要約失敗「{title}」: {e}")
-            article["summary"] = "要約を取得できませんでした"
-            article["angle"] = ""
-
-        time.sleep(0.5)  # API負荷軽減
-
-    return articles
-
-
-# ─── Teams 配信 ───────────────────────────────────────────────────────────────
-
-def build_teams_payload(articles: list[dict]) -> dict:
-    """Adaptive Card形式のTeamsペイロードを構築"""
+def build_email(articles: list[dict]) -> MIMEMultipart:
+    """HTMLメールを構築して返す"""
     now_jst = datetime.now(JST).strftime("%Y年%m月%d日 %H:%M JST")
+    subject = f"📰 note 経営・IT系記事まとめ（{datetime.now(JST).strftime('%Y/%m/%d')}）"
 
-    facts_sections = []
+    # ── HTML本文 ──
+    items_html = ""
     for i, a in enumerate(articles, 1):
-        summary_lines = a["summary"].replace("\\n", "\n")
-        body_text = (
-            f"**要約:**\n{summary_lines}\n\n"
-            f"**切り口:** {a['angle']}"
-        ) if a["angle"] else f"**要約:**\n{summary_lines}"
+        preview_html = a["preview"] if a["preview"] else "（本文プレビューなし）"
+        items_html += f"""
+        <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin-bottom:16px;">
+          <p style="margin:0 0 4px;font-size:16px;font-weight:bold;">
+            {i}. <a href="{a['url']}" style="color:#1a73e8;text-decoration:none;">{a['title']}</a>
+          </p>
+          <p style="margin:0 0 8px;font-size:12px;color:#888;">著者：{a['author']}</p>
+          <p style="margin:0;font-size:14px;color:#555;line-height:1.7;">{preview_html}</p>
+        </div>"""
 
-        facts_sections.append({
-            "type": "Container",
-            "items": [
-                {
-                    "type": "TextBlock",
-                    "text": f"{i}. [{a['title']}]({a['url']})",
-                    "wrap": True,
-                    "weight": "Bolder",
-                    "size": "Medium",
-                },
-                {
-                    "type": "TextBlock",
-                    "text": f"著者: {a['author']}",
-                    "wrap": True,
-                    "isSubtle": True,
-                    "size": "Small",
-                },
-                {
-                    "type": "TextBlock",
-                    "text": body_text,
-                    "wrap": True,
-                    "size": "Small",
-                },
-            ],
-            "separator": i > 1,
-        })
+    html_body = f"""<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="utf-8"></head>
+<body style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:700px;margin:0 auto;padding:24px;color:#333;">
+  <h2 style="border-bottom:2px solid #1a73e8;padding-bottom:8px;">
+    📰 note 経営・IT系記事まとめ
+  </h2>
+  <p style="color:#666;font-size:13px;">{now_jst}　計 {len(articles)} 件</p>
+  {items_html}
+  <hr style="border:none;border-top:1px solid #eee;margin-top:32px;">
+  <p style="font-size:11px;color:#aaa;">このメールはGitHub Actionsにより自動送信されました。</p>
+</body>
+</html>"""
 
-    payload = {
-        "type": "message",
-        "attachments": [
-            {
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "content": {
-                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                    "type": "AdaptiveCard",
-                    "version": "1.4",
-                    "body": [
-                        {
-                            "type": "TextBlock",
-                            "text": f"📰 note 経営・IT系記事まとめ（{now_jst}）",
-                            "weight": "Bolder",
-                            "size": "Large",
-                            "wrap": True,
-                        },
-                        {
-                            "type": "TextBlock",
-                            "text": f"本日 {len(articles)} 件の記事をお届けします",
-                            "isSubtle": True,
-                            "size": "Small",
-                        },
-                        *facts_sections,
-                    ],
-                },
-            }
-        ],
-    }
-    return payload
+    # ── テキスト本文（フォールバック） ──
+    text_lines = [f"note 経営・IT系記事まとめ（{now_jst}）", ""]
+    for i, a in enumerate(articles, 1):
+        text_lines.append(f"{i}. {a['title']}")
+        text_lines.append(f"   著者：{a['author']}")
+        text_lines.append(f"   {a['preview']}")
+        text_lines.append(f"   URL：{a['url']}")
+        text_lines.append("")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = GMAIL_ADDRESS
+    msg["To"] = GMAIL_ADDRESS
+    msg.attach(MIMEText("\n".join(text_lines), "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    return msg
 
 
-def post_to_teams(payload: dict) -> None:
-    resp = httpx.post(
-        TEAMS_WEBHOOK_URL,
-        json=payload,
-        timeout=30,
-        headers={"Content-Type": "application/json"},
-    )
-    resp.raise_for_status()
-    print(f"[INFO] Teams配信完了: {resp.status_code}")
+def send_gmail(msg: MIMEMultipart) -> None:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_ADDRESS, GMAIL_ADDRESS, msg.as_string())
+    print(f"[INFO] Gmail送信完了 → {GMAIL_ADDRESS}")
 
 
 # ─── メイン ──────────────────────────────────────────────────────────────────
@@ -245,23 +180,18 @@ def main() -> None:
     candidates = collect_candidates(sent_ids)
     print(f"[INFO] 未送信候補: {len(candidates)} 件")
 
-    if len(candidates) < MIN_ARTICLES:
-        print(f"[WARN] 候補が{MIN_ARTICLES}件未満({len(candidates)}件)のため配信スキップ")
-        # 候補が1件以上あれば配信する
-        if len(candidates) == 0:
-            return
+    if len(candidates) == 0:
+        print("[WARN] 配信対象の記事がありません。終了します。")
+        return
 
-    articles = summarize_articles(candidates)
-
-    payload = build_teams_payload(articles)
-    post_to_teams(payload)
+    msg = build_email(candidates)
+    send_gmail(msg)
 
     # 送信済みIDを更新
-    new_ids = sent_ids | {a["id"] for a in articles}
+    new_ids = sent_ids | {a["id"] for a in candidates}
     # 直近5000件のみ保持（肥大化防止）
     if len(new_ids) > 5000:
-        keep = sorted(new_ids)[-5000:]
-        new_ids = set(keep)
+        new_ids = set(sorted(new_ids)[-5000:])
     save_sent_ids(new_ids)
     print(f"[INFO] 送信済みID保存完了: {len(new_ids)} 件")
 
