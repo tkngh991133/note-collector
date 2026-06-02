@@ -1,5 +1,6 @@
 """
 note.com 中小企業・IT系経営者記事収集 → Gmail配信
+API: GET https://note.com/api/v3/notes?tag=<タグ名>&size=N&page=P
 """
 
 import json
@@ -23,7 +24,7 @@ BODY_PREVIEW_LEN = 100        # 本文冒頭の文字数
 
 SENT_IDS_PATH = Path(__file__).parent.parent / "sent_ids.json"
 
-NOTE_SEARCH_URL = "https://note.com/api/v2/searches"
+NOTE_NOTES_URL = "https://note.com/api/v3/notes"
 GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]         # 送信元 = 送信先（同じアドレス）
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]  # Googleアプリパスワード
 
@@ -49,24 +50,22 @@ def save_sent_ids(ids: set[str]) -> None:
 # ─── note.com 記事取得 ────────────────────────────────────────────────────────
 
 def fetch_articles_by_tag(tag: str, size: int = 10) -> list[dict]:
-    """note非公式APIでタグ検索して記事リストを返す"""
+    """GET /api/v3/notes?tag=<tag>&size=N&page=1 で記事リストを返す"""
     params = {
-        "context": "note",
-        "q": tag,
+        "tag": tag,
         "size": size,
         "page": 1,
-        "sort": "new",
     }
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; NoteCollector/1.0)",
         "Accept": "application/json",
     }
     try:
-        resp = httpx.get(NOTE_SEARCH_URL, params=params, headers=headers, timeout=20)
+        resp = httpx.get(NOTE_NOTES_URL, params=params, headers=headers, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        notes = data.get("data", {}).get("notes", {}).get("contents", [])
-        return notes
+        # レスポンス: {"data": [...], "next_page": N, "current_page": 1}
+        return data.get("data", [])
     except Exception as e:
         print(f"[WARN] タグ「{tag}」の取得失敗: {e}")
         return []
@@ -82,28 +81,29 @@ def collect_candidates(sent_ids: set[str]) -> list[dict]:
         time.sleep(1)  # レートリミット配慮
 
         for a in articles:
-            note_id = str(a.get("id", ""))
             key = a.get("key", "")
-            unique_id = note_id or key
-            if not unique_id:
+            if not key:
                 continue
-            if unique_id in seen or unique_id in sent_ids:
+            if key in seen or key in sent_ids:
                 continue
-            seen.add(unique_id)
+            seen.add(key)
 
             user = a.get("user", {})
-            raw_body = a.get("body", "") or a.get("description", "") or ""
-            preview = raw_body[:BODY_PREVIEW_LEN].strip()
-            if len(raw_body) > BODY_PREVIEW_LEN:
+            urlname = user.get("urlname", "")
+
+            # プレビュー：description → body の順で取得
+            raw_text = a.get("description", "") or a.get("body", "") or ""
+            preview = raw_text[:BODY_PREVIEW_LEN].strip()
+            if len(raw_text) > BODY_PREVIEW_LEN:
                 preview += "…"
 
             candidates.append({
-                "id": unique_id,
+                "id": key,
                 "title": a.get("name", "（タイトルなし）"),
-                "author": user.get("nickname", user.get("urlname", "不明")),
-                "url": f"https://note.com/{user.get('urlname', '')}/n/{key}" if key else "",
+                "author": user.get("nickname", user.get("name", urlname or "不明")),
+                "url": f"https://note.com/{urlname}/n/{key}" if urlname else f"https://note.com/n/{key}",
                 "preview": preview,
-                "published_at": a.get("publishAt", ""),
+                "published_at": a.get("publish_at", ""),
             })
 
     # 新しい順に並べて最大MAX_ARTICLES件
