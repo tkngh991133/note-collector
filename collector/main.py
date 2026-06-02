@@ -23,14 +23,7 @@ MIN_ARTICLES = 10              # 最低配信件数
 BODY_PREVIEW_LEN = 100        # 本文冒頭の文字数
 
 # ─── フィルタリング設定 ───────────────────────────────────────────────────────
-# いずれか1つでも含まれていれば関連記事と判定
-INCLUDE_KEYWORDS = [
-    "経営", "社長", "CEO", "代表取締役", "起業", "事業",
-    "経営者", "創業", "代表", "マネジメント", "経営戦略",
-    "ビジネスオーナー", "スタートアップ", "ベンチャー",
-    "IT経営", "DX", "SaaS", "受託", "派遣", "エンジニア派遣",
-]
-# 1つでも含まれていたら除外
+# 1つでも含まれていたら除外（包含チェックは行わない）
 EXCLUDE_KEYWORDS = [
     "競艇", "競輪", "競馬", "パチンコ", "スロット", "ギャンブル",
     "予想屋", "舟券", "車券", "馬券", "オッズ", "払い戻し",
@@ -65,25 +58,23 @@ def save_sent_ids(ids: set[str]) -> None:
 # ─── フィルタリング ───────────────────────────────────────────────────────────
 
 def is_relevant(article: dict, user_raw: dict) -> bool:
-    """関連記事かどうか判定する。除外ワードに引っかかればFalse、包含ワードがなければFalse。"""
-    # 判定対象テキストを全部まとめる（タイトル・本文冒頭・著者名・プロフィール）
+    """除外ワードが含まれていなければ通す。"""
     target = " ".join([
         article.get("name", ""),
         article.get("description", ""),
         article.get("body", "")[:300],
         user_raw.get("nickname", ""),
         user_raw.get("name", ""),
-        user_raw.get("profile", ""),         # プロフィール文（フィールドがあれば）
-        user_raw.get("biography", ""),        # 同上（別フィールド名）
+        user_raw.get("profile", ""),
+        user_raw.get("biography", ""),
     ])
 
-    # 除外ワードチェック（1つでも含まれたら即除外）
+    # 除外ワードに1つでも引っかかれば除外
     for kw in EXCLUDE_KEYWORDS:
         if kw in target:
             return False
 
-    # 包含ワードチェック（1つも含まれなければ除外）
-    return any(kw in target for kw in INCLUDE_KEYWORDS)
+    return True
 
 
 # ─── note.com 記事取得 ────────────────────────────────────────────────────────
